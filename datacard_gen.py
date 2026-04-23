@@ -1,328 +1,235 @@
+#!/usr/bin/env python3
 """
-datacard_gen: Automatically generate dataset documentation cards (datasheets) from
-tabular data files, following the Datasheets for Datasets framework.
+datacard_gen.py — Automated Dataset Datacard Generator
+Generates Hugging Face-compatible dataset datacards from CSV files or dicts.
+Stdlib-only. No external dependencies.
+"""
 
-Supports CSV, TSV, JSON Lines, and Parquet inputs. Produces structured Markdown
-output with statistical summaries, field descriptions, missing-value analysis,
-and provenance metadata.
-"""
 from __future__ import annotations
-import csv, json, hashlib, datetime, statistics
+
+import argparse
+import csv
+import io
+import json
+import math
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
-# ---------------------------------------------------------------------------
-# Field statistics
-# ---------------------------------------------------------------------------
-
-def _is_numeric(values: List[str]) -> bool:
-    count = 0
-    for v in values:
-        try:
-            float(v)
-            count += 1
-        except (ValueError, TypeError):
-            pass
-    return count / max(len(values), 1) > 0.8
-
-
-def _field_stats(name: str, values: List[str]) -> Dict[str, Any]:
-    non_null = [v for v in values if v not in ("", "null", "NULL", "None", "NA", "N/A")]
-    missing = len(values) - len(non_null)
-    stats: Dict[str, Any] = {
-        "field": name,
-        "total": len(values),
-        "missing": missing,
-        "missing_pct": round(100 * missing / max(len(values), 1), 2),
-        "unique": len(set(non_null)),
-    }
-    if _is_numeric(non_null) and non_null:
-        nums = [float(v) for v in non_null if _safe_float(v) is not None]
-        if nums:
-            stats["type"] = "numeric"
-            stats["min"] = min(nums)
-            stats["max"] = max(nums)
-            stats["mean"] = round(statistics.mean(nums), 4)
-            stats["median"] = round(statistics.median(nums), 4)
-            try:
-                stats["stdev"] = round(statistics.stdev(nums), 4)
-            except statistics.StatisticsError:
-                stats["stdev"] = 0.0
-    else:
-        stats["type"] = "categorical"
-        freq: Dict[str, int] = {}
-        for v in non_null:
-            freq[v] = freq.get(v, 0) + 1
-        top = sorted(freq.items(), key=lambda x: -x[1])[:5]
-        stats["top_values"] = [{"value": k, "count": c} for k, c in top]
-    return stats
-
-
-def _safe_float(v: str) -> Optional[float]:
+def _safe_float(v: Any) -> Optional[float]:
     try:
         return float(v)
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return None
 
 
-# ---------------------------------------------------------------------------
-# Loaders
-# ---------------------------------------------------------------------------
-
-def _load_csv(path: Path, delimiter: str = ",") -> Tuple[List[str], List[Dict[str, str]]]:
-    with path.open(newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f, delimiter=delimiter)
-        rows = list(reader)
-        return list(reader.fieldnames or []), rows
+def _is_numeric(values: List[str]) -> bool:
+    non_empty = [v for v in values if v.strip()]
+    if not non_empty:
+        return False
+    return sum(1 for v in non_empty if _safe_float(v) is not None) / len(non_empty) >= 0.8
 
 
-def _load_jsonl(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
-    rows = []
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    keys: List[str] = []
-    seen = set()
-    for row in rows:
-        for k in row:
-            if k not in seen:
-                keys.append(k)
-                seen.add(k)
-    return keys, rows
-
-
-def load_dataset(path: str) -> Tuple[List[str], List[Dict]]:
-    p = Path(path)
-    suffix = p.suffix.lower()
-    if suffix in (".csv",):
-        return _load_csv(p, delimiter=",")
-    elif suffix in (".tsv",):
-        return _load_csv(p, delimiter="\t")
-    elif suffix in (".jsonl", ".ndjson"):
-        return _load_jsonl(p)
-    elif suffix == ".parquet":
-        try:
-            import struct, io
-            # minimal parquet magic check
-            with p.open("rb") as f:
-                magic = f.read(4)
-            if magic != b"PAR1":
-                raise ValueError("Not a valid Parquet file.")
-            raise ImportError("Install pyarrow for Parquet support: pip install pyarrow")
-        except ImportError as e:
-            raise ImportError(str(e)) from e
+def _field_stats(values: List[str]) -> Dict[str, Any]:
+    non_empty = [v for v in values if v.strip()]
+    total = len(values)
+    missing = total - len(non_empty)
+    stats: Dict[str, Any] = {
+        "count": total,
+        "missing": missing,
+        "missing_pct": round(missing / total * 100, 2) if total else 0.0,
+        "unique": len(set(non_empty)),
+    }
+    if _is_numeric(non_empty):
+        nums = sorted(float(v) for v in non_empty if _safe_float(v) is not None)
+        n = len(nums)
+        if n:
+            mean = sum(nums) / n
+            stats["type"] = "numeric"
+            stats["min"] = nums[0]
+            stats["max"] = nums[-1]
+            stats["mean"] = round(mean, 4)
+            stats["std"] = round(math.sqrt(sum((x - mean)**2 for x in nums) / n), 4)
+            mid = n // 2
+            stats["median"] = nums[mid] if n % 2 else (nums[mid-1] + nums[mid]) / 2
     else:
-        raise ValueError(f"Unsupported file type: {suffix}. Use .csv, .tsv, or .jsonl")
+        stats["type"] = "categorical"
+        freq: Dict[str, int] = {}
+        for v in non_empty:
+            freq[v] = freq.get(v, 0) + 1
+        top = sorted(freq.items(), key=lambda x: -x[1])[:5]
+        stats["top_values"] = [{"value": k, "count": v} for k, v in top]
+    return stats
 
 
-# ---------------------------------------------------------------------------
-# Datacard builder
-# ---------------------------------------------------------------------------
+@dataclass
+class FieldInfo:
+    name: str
+    dtype: str
+    stats: Dict[str, Any]
 
-class DatacardGenerator:
-    """
-    Generate a Markdown datasheet from a tabular dataset.
+    def to_dict(self) -> dict:
+        return {"name": self.name, "dtype": self.dtype, "stats": self.stats}
 
-    Parameters
-    ----------
-    path : str
-        Path to the dataset file.
-    name : str, optional
-        Human-readable name for the dataset.
-    description : str, optional
-        Short description of the dataset.
-    license_str : str, optional
-        SPDX license identifier, e.g. "CC-BY-4.0".
-    source_url : str, optional
-        URL where the dataset was obtained.
-    authors : list of str, optional
-        List of dataset author names.
-    tasks : list of str, optional
-        Intended ML tasks (e.g. ["classification", "regression"]).
-    """
 
-    def __init__(
-        self,
-        path: str,
-        name: str = "",
-        description: str = "",
-        license_str: str = "Unknown",
-        source_url: str = "",
-        authors: Optional[List[str]] = None,
-        tasks: Optional[List[str]] = None,
-    ) -> None:
-        self.path = Path(path)
-        self.name = name or self.path.stem
-        self.description = description
-        self.license_str = license_str
-        self.source_url = source_url
-        self.authors = authors or []
-        self.tasks = tasks or []
-        self._fields: List[str] = []
-        self._rows: List[Dict] = []
-        self._stats: List[Dict[str, Any]] = []
-        self._loaded = False
+@dataclass
+class DataCard:
+    name: str
+    description: str
+    num_rows: int
+    num_cols: int
+    fields: List[FieldInfo] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    license: str = "unknown"
+    source: str = ""
+    version: str = "1.0.0"
 
-    def _load(self) -> None:
-        if self._loaded:
-            return
-        self._fields, self._rows = load_dataset(str(self.path))
-        for field in self._fields:
-            vals = [str(row.get(field, "")) for row in self._rows]
-            self._stats.append(_field_stats(field, vals))
-        self._loaded = True
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name, "description": self.description,
+            "num_rows": self.num_rows, "num_cols": self.num_cols,
+            "license": self.license, "source": self.source,
+            "version": self.version, "tags": self.tags,
+            "fields": [f.to_dict() for f in self.fields],
+        }
 
-    def _file_hash(self) -> str:
-        h = hashlib.sha256()
-        with self.path.open("rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
-    def _format_stat_row(self, s: Dict[str, Any]) -> str:
-        if s["type"] == "numeric":
-            detail = (f"min={s['min']}, max={s['max']}, "
-                      f"mean={s['mean']}, stdev={s.get('stdev', 'N/A')}")
-        else:
-            top = ", ".join(f"{t['value']} ({t['count']})" for t in s.get("top_values", [])[:3])
-            detail = f"top: {top}"
-        return (f"| {s['field']} | {s['type']} | {s['total']} | "
-                f"{s['missing']} ({s['missing_pct']}%) | {s['unique']} | {detail} |")
-
-    def generate(self) -> str:
-        self._load()
-        now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        size_bytes = self.path.stat().st_size
-        sha256 = self._file_hash()
-        n_rows = len(self._rows)
-        n_cols = len(self._fields)
-
-        lines = [
-            f"# Datacard: {self.name}",
-            "",
-            f"> Generated by datacard-gen on {now}",
-            "",
-            "## Overview",
-            "",
-            f"| Property | Value |",
-            f"|---|---|",
-            f"| Name | {self.name} |",
-            f"| Description | {self.description or 'N/A'} |",
-            f"| Source | {self.source_url or 'N/A'} |",
-            f"| License | {self.license_str} |",
-            f"| Authors | {', '.join(self.authors) or 'N/A'} |",
-            f"| Intended Tasks | {', '.join(self.tasks) or 'N/A'} |",
-            f"| File | {self.path.name} |",
-            f"| Size | {size_bytes:,} bytes |",
-            f"| SHA-256 | {sha256} |",
-            f"| Rows | {n_rows:,} |",
-            f"| Columns | {n_cols} |",
-            "",
-            "## Field Statistics",
-            "",
-            "| Field | Type | Total | Missing | Unique | Details |",
-            "|---|---|---|---|---|---|",
-        ]
-        for s in self._stats:
-            lines.append(self._format_stat_row(s))
-
-        # Missing value summary
-        high_missing = [s for s in self._stats if s["missing_pct"] > 10]
-        if high_missing:
+    def to_markdown(self) -> str:
+        lines = ["---", f"pretty_name: {self.name}", f"license: {self.license}", f"version: {self.version}"]
+        if self.tags:
+            lines.append("tags:")
+            for t in self.tags:
+                lines.append(f"  - {t}")
+        lines += ["---", "", f"# {self.name}", "", "## Dataset Description", "", self.description, "",
+                  "## Dataset Structure", "",
+                  f"- **Rows:** {self.num_rows:,}", f"- **Columns:** {self.num_cols}"]
+        if self.source:
+            lines.append(f"- **Source:** {self.source}")
+        lines += ["", "## Data Fields", ""]
+        for fi in self.fields:
+            s = fi.stats
             lines += [
-                "",
-                "## Data Quality Notes",
-                "",
-                "Fields with >10% missing values:",
-                "",
+                f"### `{fi.name}` ({fi.dtype})", "",
+                f"- **Missing:** {s.get('missing',0)} ({s.get('missing_pct',0):.1f}%)",
+                f"- **Unique values:** {s.get('unique','?')}",
             ]
-            for s in high_missing:
-                lines.append(f"- **{s['field']}**: {s['missing_pct']}% missing")
-
+            if fi.dtype == "numeric":
+                lines += [
+                    f"- **Min:** {s.get('min')}", f"- **Max:** {s.get('max')}",
+                    f"- **Mean:** {s.get('mean')}", f"- **Std:** {s.get('std')}",
+                    f"- **Median:** {s.get('median')}",
+                ]
+            else:
+                top = s.get("top_values", [])
+                if top:
+                    tv = ', '.join("{} ({})".format(v['value'], v['count']) for v in top)
+                    lines.append(f"- **Top values:** {tv}")
+            lines.append("")
         lines += [
-            "",
-            "## Provenance",
-            "",
-            f"- **Generated**: {now}",
-            f"- **Tool**: datacard-gen",
-            f"- **File hash (SHA-256)**: {sha256}",
-            "",
-            "---",
-            "",
-            "_This datacard was automatically generated. "
-            "Review and supplement with domain-specific context before publication._",
+            "## Dataset Statistics", "",
+            "| Field | Type | Missing | Unique |",
+            "|-------|------|---------|--------|]",
         ]
+        for fi in self.fields:
+            s = fi.stats
+            lines.append(f"| {fi.name} | {fi.dtype} | {s.get('missing_pct',0):.1f}% | {s.get('unique','?')} |")
+        lines += ["", "## License", "", f"This dataset is released under the **{self.license}** license."]
         return "\n".join(lines)
 
-    def save(self, output_path: Optional[str] = None) -> Path:
-        text = self.generate()
-        out = Path(output_path) if output_path else self.path.with_suffix(".datacard.md")
-        out.write_text(text, encoding="utf-8")
-        return out
+
+class DatacardGenerator:
+    def __init__(self, name: str = "My Dataset", description: str = "A dataset.",
+                 license: str = "cc-by-4.0", source: str = "",
+                 tags: Optional[List[str]] = None, version: str = "1.0.0"):
+        self.name = name
+        self.description = description
+        self.license = license
+        self.source = source
+        self.tags = tags or []
+        self.version = version
+
+    def _build_card(self, rows: List[Dict[str, str]]) -> DataCard:
+        if not rows:
+            return DataCard(name=self.name, description=self.description, num_rows=0, num_cols=0,
+                            license=self.license, source=self.source, tags=self.tags, version=self.version)
+        columns = list(rows[0].keys())
+        fields: List[FieldInfo] = []
+        for col in columns:
+            values = [row.get(col, "") for row in rows]
+            stats = _field_stats(values)
+            dtype = stats.pop("type", "categorical")
+            fields.append(FieldInfo(name=col, dtype=dtype, stats=stats))
+        return DataCard(name=self.name, description=self.description,
+                        num_rows=len(rows), num_cols=len(columns), fields=fields,
+                        license=self.license, source=self.source, tags=self.tags, version=self.version)
+
+    def generate_from_csv(self, path: Path) -> DataCard:
+        rows: List[Dict[str, str]] = []
+        with path.open(encoding="utf-8", errors="replace", newline="") as fh:
+            for row in csv.DictReader(fh):
+                rows.append(dict(row))
+        return self._build_card(rows)
+
+    def generate_from_dict(self, data: List[Dict[str, Any]]) -> DataCard:
+        return self._build_card([{k: str(v) for k, v in row.items()} for row in data])
+
+    def generate(self, source) -> DataCard:
+        if isinstance(source, Path):
+            return self.generate_from_csv(source)
+        if isinstance(source, list):
+            return self.generate_from_dict(source)
+        if isinstance(source, dict):
+            keys = list(source.keys())
+            if not keys:
+                return self._build_card([])
+            n = len(source[keys[0]])
+            return self._build_card([{k: str(source[k][i]) for k in keys} for i in range(n)])
+        raise TypeError(f"Unsupported source type: {type(source)}")
 
 
-# ---------------------------------------------------------------------------
-# Convenience function
-# ---------------------------------------------------------------------------
-
-def generate_datacard(
-    input_path: str,
-    output_path: Optional[str] = None,
-    **kwargs: Any,
-) -> str:
-    """
-    Generate a datacard for a dataset file and optionally write it to disk.
-
-    Parameters
-    ----------
-    input_path : str
-        Path to the input dataset (CSV, TSV, or JSONL).
-    output_path : str, optional
-        Where to write the Markdown output. Defaults to <input>.datacard.md.
-    **kwargs
-        Forwarded to DatacardGenerator (name, description, license_str, etc.).
-
-    Returns
-    -------
-    str
-        The generated Markdown text.
-    """
-    gen = DatacardGenerator(input_path, **kwargs)
-    text = gen.generate()
-    out = gen.save(output_path)
-    print(f"Datacard written to {out}")
-    return text
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(prog="datacard_gen", description="Generate dataset datacards from CSV files.")
+    p.add_argument("csv", nargs="?", help="Input CSV file (default: stdin).")
+    p.add_argument("--name", default=None)
+    p.add_argument("--description", default="A dataset generated automatically.")
+    p.add_argument("--license", default="cc-by-4.0")
+    p.add_argument("--source", default="")
+    p.add_argument("--tags", default="", help="Comma-separated tags.")
+    p.add_argument("--version", default="1.0.0")
+    p.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    p.add_argument("--output", "-o", help="Write to file instead of stdout.")
+    return p.parse_args(argv)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def _cli() -> None:
-    import argparse
-    parser = argparse.ArgumentParser(
-        prog="datacard-gen",
-        description="Generate dataset documentation cards from tabular data files.",
-    )
-    parser.add_argument("input", help="Path to dataset (CSV/TSV/JSONL).")
-    parser.add_argument("-o", "--output", default=None, help="Output .md path.")
-    parser.add_argument("-n", "--name", default="", help="Dataset name.")
-    parser.add_argument("-d", "--description", default="")
-    parser.add_argument("-l", "--license", dest="license_str", default="Unknown")
-    parser.add_argument("-s", "--source", dest="source_url", default="")
-    parser.add_argument("-a", "--authors", nargs="+", default=[])
-    parser.add_argument("-t", "--tasks", nargs="+", default=[])
-    args = parser.parse_args()
-    generate_datacard(
-        args.input, args.output,
-        name=args.name, description=args.description,
-        license_str=args.license_str, source_url=args.source_url,
-        authors=args.authors, tasks=args.tasks,
-    )
+def main(argv=None) -> int:
+    args = _parse_args(argv)
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    if args.csv:
+        path = Path(args.csv)
+        if not path.is_file():
+            print(f"Error: file not found: {args.csv}", file=sys.stderr)
+            return 1
+        gen = DatacardGenerator(name=args.name or path.stem, description=args.description,
+                                license=args.license, source=args.source, tags=tags, version=args.version)
+        card = gen.generate_from_csv(path)
+    else:
+        raw = sys.stdin.read()
+        rows = [dict(r) for r in csv.DictReader(io.StringIO(raw))]
+        gen = DatacardGenerator(name=args.name or "dataset", description=args.description,
+                                license=args.license, source=args.source, tags=tags, version=args.version)
+        card = gen.generate_from_dict(rows)
+    output = card.to_json() if args.format == "json" else card.to_markdown()
+    if args.output:
+        Path(args.output).write_text(output, encoding="utf-8")
+        print(f"Datacard written to {args.output}")
+    else:
+        print(output)
+    return 0
 
 
 if __name__ == "__main__":
-    _cli()
+    sys.exit(main())
