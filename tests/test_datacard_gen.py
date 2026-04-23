@@ -7,11 +7,11 @@ def test_import():
 
 def test_is_numeric_true():
     import datacard_gen as dcg
-    assert dcg._is_numeric('3.14')
+    assert dcg._is_numeric(['3.14'])
 
 def test_is_numeric_false():
     import datacard_gen as dcg
-    assert not dcg._is_numeric('hello')
+    assert not dcg._is_numeric(['hello'])
 
 def test_safe_float():
     import datacard_gen as dcg
