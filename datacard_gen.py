@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 datacard_gen.py — Automated Dataset Datacard Generator
-Generates Hugging Face-compatible dataset datacards from CSV files or dicts.
+Generates Hugging Face-compatible dataset datacards from CSV or JSON files.
 Stdlib-only. No external dependencies.
 """
 
@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,13 +133,66 @@ class DataCard:
         lines += [
             "## Dataset Statistics", "",
             "| Field | Type | Missing | Unique |",
-            "|-------|------|---------|--------|]",
+            "|-------|------|---------|--------|",
         ]
         for fi in self.fields:
             s = fi.stats
             lines.append(f"| {fi.name} | {fi.dtype} | {s.get('missing_pct',0):.1f}% | {s.get('unique','?')} |")
         lines += ["", "## License", "", f"This dataset is released under the **{self.license}** license."]
         return "\n".join(lines)
+
+
+_SPDX_COMMON = {
+    "mit", "apache-2.0", "gpl-2.0", "gpl-3.0", "lgpl-2.1", "lgpl-3.0",
+    "bsd-2-clause", "bsd-3-clause", "cc0-1.0", "cc-by-4.0", "cc-by-sa-4.0",
+    "cc-by-nc-4.0", "cc-by-nc-sa-4.0", "cc-by-nd-4.0", "openrail", "unknown",
+}
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+@dataclass
+class ValidationResult:
+    valid: bool
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        lines = [f"Valid: {self.valid}"]
+        for e in self.errors:
+            lines.append(f"  ERROR: {e}")
+        for w in self.warnings:
+            lines.append(f"  WARNING: {w}")
+        return "\n".join(lines)
+
+
+class DatacardSchema:
+    """Validates a DataCard against the Hugging Face dataset card schema."""
+
+    def validate(self, card: "DataCard") -> ValidationResult:
+        errors: List[str] = []
+        warnings: List[str] = []
+        if not card.name or not card.name.strip():
+            errors.append("'name' is required and must not be empty.")
+        if not card.description or card.description.strip() in (
+            "", "A dataset.", "A dataset generated automatically."
+        ):
+            warnings.append("'description' is a placeholder; provide a meaningful description.")
+        if not _SEMVER_RE.match(card.version):
+            warnings.append(
+                f"'version' '{card.version}' does not follow semantic versioning (MAJOR.MINOR.PATCH)."
+            )
+        if card.license.lower() not in _SPDX_COMMON:
+            warnings.append(f"'license' '{card.license}' is not a recognised SPDX identifier.")
+        if not card.tags:
+            warnings.append("'tags' is empty. Adding tags improves Hub discoverability.")
+        if card.num_rows == 0:
+            warnings.append("Dataset has zero rows.")
+        for fi in card.fields:
+            if not fi.name or not fi.name.strip():
+                errors.append("A field has an empty name.")
+            if fi.dtype not in ("numeric", "categorical"):
+                errors.append(f"Field '{fi.name}' has unknown dtype '{fi.dtype}'.")
+        return ValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
 
 
 class DatacardGenerator:
@@ -174,11 +228,28 @@ class DatacardGenerator:
                 rows.append(dict(row))
         return self._build_card(rows)
 
+    def generate_from_json(self, path: Path) -> DataCard:
+        with path.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            rows: List[Dict[str, str]] = [{k: str(v) for k, v in rec.items()} for rec in data]
+        elif isinstance(data, dict):
+            keys = list(data.keys())
+            if not keys:
+                return self._build_card([])
+            n = len(data[keys[0]])
+            rows = [{k: str(data[k][i]) for k in keys} for i in range(n)]
+        else:
+            raise ValueError("JSON must be a list of records or a column-oriented dict.")
+        return self._build_card(rows)
+
     def generate_from_dict(self, data: List[Dict[str, Any]]) -> DataCard:
         return self._build_card([{k: str(v) for k, v in row.items()} for row in data])
 
     def generate(self, source) -> DataCard:
         if isinstance(source, Path):
+            if source.suffix.lower() == ".json":
+                return self.generate_from_json(source)
             return self.generate_from_csv(source)
         if isinstance(source, list):
             return self.generate_from_dict(source)
@@ -192,15 +263,21 @@ class DatacardGenerator:
 
 
 def _parse_args(argv=None):
-    p = argparse.ArgumentParser(prog="datacard_gen", description="Generate dataset datacards from CSV files.")
-    p.add_argument("csv", nargs="?", help="Input CSV file (default: stdin).")
+    p = argparse.ArgumentParser(
+        prog="datacard-gen",
+        description="Generate dataset datacards from CSV or JSON files.",
+    )
+    p.add_argument("file", nargs="?", help="Input CSV or JSON file (default: read CSV from stdin).")
     p.add_argument("--name", default=None)
     p.add_argument("--description", default="A dataset generated automatically.")
     p.add_argument("--license", default="cc-by-4.0")
     p.add_argument("--source", default="")
     p.add_argument("--tags", default="", help="Comma-separated tags.")
     p.add_argument("--version", default="1.0.0")
-    p.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    p.add_argument("--format", choices=["markdown", "json"], default="markdown",
+                   help="Output format (default: markdown).")
+    p.add_argument("--validate", action="store_true",
+                   help="Validate the generated card and print any warnings/errors.")
     p.add_argument("--output", "-o", help="Write to file instead of stdout.")
     return p.parse_args(argv)
 
@@ -208,20 +285,25 @@ def _parse_args(argv=None):
 def main(argv=None) -> int:
     args = _parse_args(argv)
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
-    if args.csv:
-        path = Path(args.csv)
+    if args.file:
+        path = Path(args.file)
         if not path.is_file():
-            print(f"Error: file not found: {args.csv}", file=sys.stderr)
+            print(f"Error: file not found: {args.file}", file=sys.stderr)
             return 1
         gen = DatacardGenerator(name=args.name or path.stem, description=args.description,
                                 license=args.license, source=args.source, tags=tags, version=args.version)
-        card = gen.generate_from_csv(path)
+        card = gen.generate(path)
     else:
         raw = sys.stdin.read()
         rows = [dict(r) for r in csv.DictReader(io.StringIO(raw))]
         gen = DatacardGenerator(name=args.name or "dataset", description=args.description,
                                 license=args.license, source=args.source, tags=tags, version=args.version)
         card = gen.generate_from_dict(rows)
+    if args.validate:
+        result = DatacardSchema().validate(card)
+        print(str(result), file=sys.stderr)
+        if not result.valid:
+            return 2
     output = card.to_json() if args.format == "json" else card.to_markdown()
     if args.output:
         Path(args.output).write_text(output, encoding="utf-8")
@@ -229,6 +311,10 @@ def main(argv=None) -> int:
     else:
         print(output)
     return 0
+
+
+# Entry-point alias used by pyproject.toml
+_cli = main
 
 
 if __name__ == "__main__":
