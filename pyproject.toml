@@ -21,7 +21,8 @@ classifiers = [
 ]
 
 [project.scripts]
-datacard-gen = "datacard_gen:_cli"
+datacard-gen = "datacard_gen:main"
+datacard-gen-gui = "datacard_gen_gui:main"
 
 [tool.setuptools]
-py-modules = ["datacard_gen"]
+py-modules = ["datacard_gen", "datacard_gen_gui"]
