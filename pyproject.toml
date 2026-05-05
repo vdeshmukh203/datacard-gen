@@ -20,8 +20,16 @@ classifiers = [
     "Topic :: Documentation",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.scripts]
 datacard-gen = "datacard_gen:_cli"
+datacard-gen-gui = "gui:launch"
+
+[project.urls]
+Homepage = "https://github.com/vdeshmukh203/datacard-gen"
+"Bug Tracker" = "https://github.com/vdeshmukh203/datacard-gen/issues"
 
 [tool.setuptools]
-py-modules = ["datacard_gen"]
+py-modules = ["datacard_gen", "gui"]
