@@ -1,26 +1,20 @@
-#!/usr/bin/env python3
-"""
-datacard_gen.py — Automated Dataset Datacard Generator
-
-Generates Hugging Face-compatible dataset datacards from CSV, JSON, or dict
-sources.  Stdlib-only; no external dependencies required for CSV/JSON input.
-Parquet/Arrow support requires ``pyarrow`` (optional).
-"""
+"""Core datacard generation logic for the datacard_gen package."""
 
 from __future__ import annotations
 
-import argparse
 import csv
-import io
 import json
 import math
-import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _safe_float(v: Any) -> Optional[float]:
+    """Return *v* as float, or None if conversion fails."""
     try:
         return float(v)
     except (TypeError, ValueError):
@@ -28,10 +22,12 @@ def _safe_float(v: Any) -> Optional[float]:
 
 
 def _is_numeric(values: List[str]) -> bool:
-    non_empty = [v for v in values if v.strip()]
+    """Return True when ≥ 80 % of non-empty *values* parse as floats."""
+    non_empty = [v for v in values if str(v).strip()]
     if not non_empty:
         return False
-    return sum(1 for v in non_empty if _safe_float(v) is not None) / len(non_empty) >= 0.8
+    parseable = sum(1 for v in non_empty if _safe_float(v) is not None)
+    return parseable / len(non_empty) >= 0.8
 
 
 def _percentile(sorted_nums: List[float], pct: float) -> float:
@@ -44,6 +40,7 @@ def _percentile(sorted_nums: List[float], pct: float) -> float:
 
 
 def _field_stats(values: List[str]) -> Dict[str, Any]:
+    """Compute per-column statistics for a list of string values."""
     non_empty = [v for v in values if str(v).strip()]
     total = len(values)
     missing = total - len(non_empty)
@@ -58,53 +55,81 @@ def _field_stats(values: List[str]) -> Dict[str, Any]:
         n = len(nums)
         if n:
             mean = sum(nums) / n
-            stats["type"] = "numeric"
-            stats["min"] = nums[0]
-            stats["max"] = nums[-1]
-            stats["mean"] = round(mean, 4)
-            stats["std"] = round(math.sqrt(sum((x - mean) ** 2 for x in nums) / n), 4)
-            stats["median"] = _percentile(nums, 50)
-            stats["q1"] = _percentile(nums, 25)
-            stats["q3"] = _percentile(nums, 75)
+            stats.update({
+                "type": "numeric",
+                "min": nums[0],
+                "max": nums[-1],
+                "mean": round(mean, 4),
+                "std": round(math.sqrt(sum((x - mean) ** 2 for x in nums) / n), 4),
+                "median": _percentile(nums, 50),
+                "q1": _percentile(nums, 25),
+                "q3": _percentile(nums, 75),
+            })
     else:
-        stats["type"] = "categorical"
         freq: Dict[str, int] = {}
         for v in non_empty:
             freq[v] = freq.get(v, 0) + 1
         top = sorted(freq.items(), key=lambda x: -x[1])[:5]
-        stats["top_values"] = [{"value": k, "count": v} for k, v in top]
+        stats.update({
+            "type": "categorical",
+            "top_values": [{"value": k, "count": v} for k, v in top],
+        })
     return stats
 
 
-@dataclass
-class FieldInfo:
-    name: str
-    dtype: str
-    stats: Dict[str, Any]
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
-    def to_dict(self) -> dict:
+class FieldInfo:
+    """Name, detected type, and summary statistics for one dataset column."""
+
+    def __init__(self, name: str, dtype: str, stats: Dict[str, Any]) -> None:
+        self.name = name
+        self.dtype = dtype
+        self.stats = stats
+
+    def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "dtype": self.dtype, "stats": self.stats}
 
 
-@dataclass
 class DataCard:
-    name: str
-    description: str
-    num_rows: int
-    num_cols: int
-    fields: List[FieldInfo] = field(default_factory=list)
-    tags: List[str] = field(default_factory=list)
-    license: str = "unknown"
-    source: str = ""
-    version: str = "1.0.0"
-    examples: List[Dict[str, str]] = field(default_factory=list)
+    """A structured, serialisable dataset documentation card."""
 
-    def to_dict(self) -> dict:
-        d = {
-            "name": self.name, "description": self.description,
-            "num_rows": self.num_rows, "num_cols": self.num_cols,
-            "license": self.license, "source": self.source,
-            "version": self.version, "tags": self.tags,
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        num_rows: int,
+        num_cols: int,
+        fields: Optional[List[FieldInfo]] = None,
+        tags: Optional[List[str]] = None,
+        license: str = "unknown",
+        source: str = "",
+        version: str = "1.0.0",
+        examples: Optional[List[Dict[str, str]]] = None,
+    ) -> None:
+        self.name = name
+        self.description = description
+        self.num_rows = num_rows
+        self.num_cols = num_cols
+        self.fields: List[FieldInfo] = fields or []
+        self.tags: List[str] = tags or []
+        self.license = license
+        self.source = source
+        self.version = version
+        self.examples: List[Dict[str, str]] = examples or []
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "name": self.name,
+            "description": self.description,
+            "num_rows": self.num_rows,
+            "num_cols": self.num_cols,
+            "license": self.license,
+            "source": self.source,
+            "version": self.version,
+            "tags": self.tags,
             "fields": [f.to_dict() for f in self.fields],
         }
         if self.examples:
@@ -112,9 +137,12 @@ class DataCard:
         return d
 
     def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+        """Serialise to JSON string."""
+        import json as _json
+        return _json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     def to_markdown(self) -> str:
+        """Render a Hugging Face-compatible Markdown datacard."""
         lines = [
             "---",
             f"pretty_name: {self.name}",
@@ -156,7 +184,7 @@ class DataCard:
             else:
                 top = s.get("top_values", [])
                 if top:
-                    tv = ", ".join("{} ({})".format(v["value"], v["count"]) for v in top)
+                    tv = ", ".join(f"{v['value']} ({v['count']})" for v in top)
                     lines.append(f"- **Top values:** {tv}")
             lines.append("")
         if self.examples:
@@ -175,16 +203,34 @@ class DataCard:
         ]
         for fi in self.fields:
             s = fi.stats
-            lines.append(f"| {fi.name} | {fi.dtype} | {s.get('missing_pct', 0):.1f}% | {s.get('unique', '?')} |")
-        lines += ["", "## License", "", f"This dataset is released under the **{self.license}** license."]
+            lines.append(
+                f"| {fi.name} | {fi.dtype} | {s.get('missing_pct', 0):.1f}% | {s.get('unique', '?')} |"
+            )
+        lines += [
+            "",
+            "## License", "",
+            f"This dataset is released under the **{self.license}** license.",
+        ]
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+
 class DatacardGenerator:
-    def __init__(self, name: str = "My Dataset", description: str = "A dataset.",
-                 license: str = "cc-by-4.0", source: str = "",
-                 tags: Optional[List[str]] = None, version: str = "1.0.0",
-                 num_examples: int = 5):
+    """Generate :class:`DataCard` objects from CSV, JSON, or Python data."""
+
+    def __init__(
+        self,
+        name: str = "My Dataset",
+        description: str = "A dataset.",
+        license: str = "cc-by-4.0",
+        source: str = "",
+        tags: Optional[List[str]] = None,
+        version: str = "1.0.0",
+        num_examples: int = 5,
+    ) -> None:
         self.name = name
         self.description = description
         self.license = license
@@ -193,10 +239,18 @@ class DatacardGenerator:
         self.version = version
         self.num_examples = num_examples
 
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
     def _build_card(self, rows: List[Dict[str, str]]) -> DataCard:
         if not rows:
-            return DataCard(name=self.name, description=self.description, num_rows=0, num_cols=0,
-                            license=self.license, source=self.source, tags=self.tags, version=self.version)
+            return DataCard(
+                name=self.name, description=self.description,
+                num_rows=0, num_cols=0,
+                license=self.license, source=self.source,
+                tags=self.tags, version=self.version,
+            )
         columns = list(rows[0].keys())
         fields: List[FieldInfo] = []
         for col in columns:
@@ -205,12 +259,19 @@ class DatacardGenerator:
             dtype = stats.pop("type", "categorical")
             fields.append(FieldInfo(name=col, dtype=dtype, stats=stats))
         examples = rows[: self.num_examples] if self.num_examples > 0 else []
-        return DataCard(name=self.name, description=self.description,
-                        num_rows=len(rows), num_cols=len(columns), fields=fields,
-                        license=self.license, source=self.source, tags=self.tags,
-                        version=self.version, examples=examples)
+        return DataCard(
+            name=self.name, description=self.description,
+            num_rows=len(rows), num_cols=len(columns),
+            fields=fields, license=self.license, source=self.source,
+            tags=self.tags, version=self.version, examples=examples,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def generate_from_csv(self, path: Path) -> DataCard:
+        """Read a CSV file and return a :class:`DataCard`."""
         rows: List[Dict[str, str]] = []
         with path.open(encoding="utf-8", errors="replace", newline="") as fh:
             for row in csv.DictReader(fh):
@@ -218,11 +279,14 @@ class DatacardGenerator:
         return self._build_card(rows)
 
     def generate_from_json(self, path: Path) -> DataCard:
+        """Read a JSON file (array of objects or column dict) and return a :class:`DataCard`."""
         with path.open(encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, list):
-            rows = [{k: str(v) for k, v in (r.items() if isinstance(r, dict) else enumerate([r]))}
-                    for r in data]
+            rows = [
+                {k: str(v) for k, v in (r.items() if isinstance(r, dict) else {str(i): str(r)}.items())}
+                for i, r in enumerate(data)
+            ]
         elif isinstance(data, dict):
             keys = list(data.keys())
             if not keys:
@@ -230,13 +294,15 @@ class DatacardGenerator:
             n = len(data[keys[0]])
             rows = [{k: str(data[k][i]) for k in keys} for i in range(n)]
         else:
-            raise ValueError("JSON must be an array of objects or a column-oriented dict.")
+            raise ValueError("JSON must be an array of objects or a column-oriented mapping.")
         return self._build_card(rows)
 
     def generate_from_dict(self, data: List[Dict[str, Any]]) -> DataCard:
+        """Accept a list of dicts (as from ``csv.DictReader``) and return a :class:`DataCard`."""
         return self._build_card([{k: str(v) for k, v in row.items()} for row in data])
 
-    def generate(self, source) -> DataCard:
+    def generate(self, source: Any) -> DataCard:
+        """Dispatch to the appropriate loader based on *source* type or file extension."""
         if isinstance(source, Path):
             suffix = source.suffix.lower()
             if suffix == ".json":
@@ -268,62 +334,3 @@ class DatacardGenerator:
                 "Reading Parquet/Arrow files requires pyarrow. "
                 "Install it with: pip install pyarrow"
             )
-
-
-def _parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        prog="datacard-gen",
-        description="Generate Hugging Face-compatible dataset datacards from CSV or JSON files.",
-    )
-    p.add_argument("input", nargs="?", help="Input dataset file (.csv or .json). Reads CSV from stdin if omitted.")
-    p.add_argument("--name", default=None, help="Dataset name (defaults to filename stem).")
-    p.add_argument("--description", default="A dataset generated automatically.")
-    p.add_argument("--license", default="cc-by-4.0")
-    p.add_argument("--source", default="", help="Source URL or reference.")
-    p.add_argument("--tags", default="", help="Comma-separated tags.")
-    p.add_argument("--version", default="1.0.0")
-    p.add_argument("--examples", type=int, default=5, metavar="N",
-                   help="Number of example rows to embed in the card (default: 5).")
-    p.add_argument("--format", choices=["markdown", "json"], default="markdown",
-                   help="Output format (default: markdown).")
-    p.add_argument("--output", "-o", help="Write output to FILE instead of stdout.")
-    return p.parse_args(argv)
-
-
-def main(argv=None) -> int:
-    args = _parse_args(argv)
-    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
-    gen_kwargs = dict(
-        description=args.description,
-        license=args.license,
-        source=args.source,
-        tags=tags,
-        version=args.version,
-        num_examples=args.examples,
-    )
-    if args.input:
-        path = Path(args.input)
-        if not path.is_file():
-            print(f"Error: file not found: {args.input}", file=sys.stderr)
-            return 1
-        gen = DatacardGenerator(name=args.name or path.stem, **gen_kwargs)
-        card = gen.generate(path)
-    else:
-        raw = sys.stdin.read()
-        rows = [dict(r) for r in csv.DictReader(io.StringIO(raw))]
-        gen = DatacardGenerator(name=args.name or "dataset", **gen_kwargs)
-        card = gen.generate_from_dict(rows)
-    output = card.to_json() if args.format == "json" else card.to_markdown()
-    if args.output:
-        Path(args.output).write_text(output, encoding="utf-8")
-        print(f"Datacard written to {args.output}")
-    else:
-        print(output)
-    return 0
-
-
-_cli = main  # entry-point alias used by pyproject.toml
-
-
-if __name__ == "__main__":
-    sys.exit(main())

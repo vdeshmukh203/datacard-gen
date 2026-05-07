@@ -20,8 +20,20 @@ classifiers = [
     "Topic :: Documentation",
 ]
 
-[project.scripts]
-datacard-gen = "datacard_gen:_cli"
+[project.optional-dependencies]
+parquet = ["pyarrow>=10"]
+dev = ["pytest>=7", "pytest-cov"]
 
-[tool.setuptools]
-py-modules = ["datacard_gen"]
+[project.scripts]
+datacard-gen = "datacard_gen._cli:main"
+datacard-gen-gui = "datacard_gen.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["datacard_gen"]
