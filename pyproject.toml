@@ -20,8 +20,12 @@ classifiers = [
     "Topic :: Documentation",
 ]
 
+[project.optional-dependencies]
+gui = []  # tkinter is bundled with CPython; listed for documentation purposes
+
 [project.scripts]
 datacard-gen = "datacard_gen:_cli"
+datacard-gen-gui = "datacard_gui:main"
 
 [tool.setuptools]
-py-modules = ["datacard_gen"]
+py-modules = ["datacard_gen", "datacard_gui"]
