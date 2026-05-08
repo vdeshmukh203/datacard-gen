@@ -1,18 +1,30 @@
 """
 datacard_gen: Automated dataset documentation card generator.
 
-Analyses a dataset directory or HuggingFace dataset repository and generates
-a structured dataset card conforming to the HuggingFace DatasetCard schema.
-Infers statistics, feature types, splits, and licence information from the
-data itself, reducing the manual effort required for reproducible dataset
-documentation.
+Analyses a dataset file (CSV or JSON) and generates a structured dataset card
+conforming to the Hugging Face DatasetCard schema and the Datasheets for
+Datasets framework.  Infers statistics, feature types, and missing-value
+rates from the data itself, reducing the manual effort required for
+reproducible dataset documentation.
 """
 
-__version__ = "0.1.0"
-__author__ = "Vaibhav Deshmukh"
-__license__ = "MIT"
+from __future__ import annotations
 
-from .generator import DatacardGenerator
-from .schema import DatacardSchema
+# Re-export the public API from the top-level module so that both
+#   ``import datacard_gen`` (root-level script) and
+#   ``from datacard_gen import DatacardGenerator`` (installed package)
+#   work identically.
+import importlib as _importlib
+import sys as _sys
 
-__all__ = ["DatacardGenerator", "DatacardSchema"]
+_root = _importlib.import_module("datacard_gen")
+
+DatacardGenerator = _root.DatacardGenerator
+DataCard = _root.DataCard
+FieldInfo = _root.FieldInfo
+
+__version__ = _root.__version__
+__author__ = _root.__author__
+__license__ = _root.__license__
+
+__all__ = ["DatacardGenerator", "DataCard", "FieldInfo", "__version__"]
